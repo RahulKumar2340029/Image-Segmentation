@@ -1,114 +1,218 @@
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
+import streamlit as st
+from PIL import Image
+import io
+import tempfile
+import os
 
-# --- Parameters to Tune ---
-# Define the range for the BACKGROUND color (white/light gray) in HSV
-# White/Gray usually has LOW Saturation and HIGH Value. Hue can be broad.
-# You WILL likely need to ADJUST these based on your specific image's lighting/shadows.
-lower_background_hsv = np.array([0, 0, 150])     # Lower bound (Min Hue, Min Sat, Min Brightness)
-upper_background_hsv = np.array([179, 70, 255])  # Upper bound (Max Hue, Max Sat, Max Brightness)
-# Note: Hue wraps around (0/179 are reds), Sat 0-~70 covers grays/whites, Val >~150 covers bright areas
+def process_image(img, background_img, lower_background_hsv, upper_background_hsv, 
+                  kernel_size_closing, kernel_size_opening):
+    """
+    Process an image to replace its background
+    """
+    # Resize background to match input image size
+    img_h, img_w = img.shape[:2]
+    background_img = cv2.resize(background_img, (img_w, img_h))
 
-# Morphological Kernel Size (May need adjustment)
-kernel_size_closing = 10 # Closing might help fill shadow gaps in background
-kernel_size_opening = 5  # Opening helps remove small non-background specks
-# --- End Parameters ---
+    # Preprocessing - Optional Blur
+    blurred_img = cv2.GaussianBlur(img, (5, 5), 0)
 
-# --- File Paths ---
-input_image_path = 'lion.jpg'  # Use the same image you showed
-background_image_path = 'sky.jpeg' # Change to your background file
-# --- End File Paths ---
+    # Convert to HSV Color Space
+    hsv_img = cv2.cvtColor(blurred_img, cv2.COLOR_BGR2HSV)
 
-# 1. Load Images
-img = cv2.imread(input_image_path)
-background_img = cv2.imread(background_image_path)
+    # Create Mask for the BACKGROUND using Color Thresholding
+    mask_background = cv2.inRange(hsv_img, lower_background_hsv, upper_background_hsv)
 
-if img is None:
-    print(f"Error: Could not load input image at {input_image_path}")
-    exit()
-if background_img is None:
-    print(f"Error: Could not load background image at {background_image_path}")
-    exit()
+    # Refine BACKGROUND Mask using Morphological Operations
+    # Closing helps bridge gaps in the background (e.g., across shadows)
+    kernel_close = np.ones((kernel_size_closing, kernel_size_closing), np.uint8)
+    mask_background_closed = cv2.morphologyEx(mask_background, cv2.MORPH_CLOSE, kernel_close, iterations=1)
 
-# Resize background to match input image size
-img_h, img_w = img.shape[:2]
-background_img = cv2.resize(background_img, (img_w, img_h))
+    # Opening removes small noise elements
+    kernel_open = np.ones((kernel_size_opening, kernel_size_opening), np.uint8)
+    mask_background_opened = cv2.morphologyEx(mask_background_closed, cv2.MORPH_OPEN, kernel_open, iterations=1)
 
-# 2. Preprocessing - Optional Blur
-blurred_img = cv2.GaussianBlur(img, (5, 5), 0)
+    # Use refined mask as needed
+    if st.session_state.use_morphology:
+        refined_background_mask = mask_background_opened
+    else:
+        refined_background_mask = mask_background
 
-# 3. Convert to HSV Color Space
-hsv_img = cv2.cvtColor(blurred_img, cv2.COLOR_BGR2HSV)
+    # INVERT the background mask to get the FOREGROUND mask
+    final_mask = cv2.bitwise_not(refined_background_mask)
 
-# 4. Create Mask for the BACKGROUND using Color Thresholding
-mask_background = cv2.inRange(hsv_img, lower_background_hsv, upper_background_hsv)
+    # Inverse mask for the NEW background
+    inverse_mask_for_new_bg = refined_background_mask
 
-# 5. Refine BACKGROUND Mask using Morphological Operations
-# Closing first can help bridge gaps in the background (e.g., across shadows)
-kernel_close = np.ones((kernel_size_closing, kernel_size_closing), np.uint8)
-mask_background_closed = cv2.morphologyEx(mask_background, cv2.MORPH_CLOSE, kernel_close, iterations=1)
+    # Apply Masks to Extract Foreground and Background Parts
+    foreground = cv2.bitwise_and(img, img, mask=final_mask)
+    new_background_part = cv2.bitwise_and(background_img, background_img, mask=inverse_mask_for_new_bg)
 
-# Opening removes small noise elements (pixels falsely identified as background)
-kernel_open = np.ones((kernel_size_opening, kernel_size_opening), np.uint8)
-mask_background_opened = cv2.morphologyEx(mask_background_closed, cv2.MORPH_OPEN, kernel_open, iterations=1)
+    # Combine Foreground and New Background
+    final_result = cv2.add(foreground, new_background_part)
 
-# This is the refined mask identifying the BACKGROUND
-refined_background_mask = mask_background
-# refined_background_mask = mask_background_opened
+    return {
+        'original': img,
+        'background_mask': mask_background,
+        'refined_mask': refined_background_mask,
+        'foreground_mask': final_mask,
+        'foreground': foreground,
+        'final_result': final_result
+    }
 
-# 6. *** INVERT the background mask to get the FOREGROUND mask ***
-final_mask = cv2.bitwise_not(refined_background_mask)
+def main():
+    st.set_page_config(page_title="Background Replacement App", layout="wide")
+    st.title("Background Replacement Tool")
+    st.write("Upload an image to extract the foreground and replace the background")
 
-# Create an inverse mask for the NEW background (this will be the refined_background_mask)
-inverse_mask_for_new_bg = refined_background_mask # Pixels that ARE background
+    # Initialize session state variables if they don't exist
+    if 'lower_h' not in st.session_state:
+        st.session_state.lower_h = 0
+        st.session_state.lower_s = 0
+        st.session_state.lower_v = 150
+        st.session_state.upper_h = 179
+        st.session_state.upper_s = 70
+        st.session_state.upper_v = 255
+        st.session_state.kernel_closing = 10
+        st.session_state.kernel_opening = 5
+        st.session_state.use_morphology = True
 
-# 7. Apply Masks to Extract Foreground and Background Parts
-# Extract foreground from the original image using the inverted mask
-foreground = cv2.bitwise_and(img, img, mask=final_mask)
+    # Create two columns for the upload widgets
+    col1, col2 = st.columns(2)
 
-# Extract the relevant part of the new background image using the background mask
-new_background_part = cv2.bitwise_and(background_img, background_img, mask=inverse_mask_for_new_bg)
+    with col1:
+        # Input image upload
+        input_image = st.file_uploader("Upload foreground image", type=["jpg", "jpeg", "png"])
+    
+    with col2:
+        # Background image upload
+        background_image = st.file_uploader("Upload background image", type=["jpg", "jpeg", "png"])
+    
+    # Create sidebar for parameter tuning
+    st.sidebar.header("Parameter Tuning")
+    
+    # HSV Range for Background Detection
+    st.sidebar.subheader("Background Color Range (HSV)")
+    
+    # Create columns for the HSV sliders
+    col_h1, col_h2 = st.sidebar.columns(2)
+    with col_h1:
+        st.session_state.lower_h = st.slider("Min Hue", 0, 179, st.session_state.lower_h)
+    with col_h2:
+        st.session_state.upper_h = st.slider("Max Hue", 0, 179, st.session_state.upper_h)
+    
+    col_s1, col_s2 = st.sidebar.columns(2)
+    with col_s1:
+        st.session_state.lower_s = st.slider("Min Saturation", 0, 255, st.session_state.lower_s)
+    with col_s2:
+        st.session_state.upper_s = st.slider("Max Saturation", 0, 255, st.session_state.upper_s)
+    
+    col_v1, col_v2 = st.sidebar.columns(2)
+    with col_v1:
+        st.session_state.lower_v = st.slider("Min Value", 0, 255, st.session_state.lower_v)
+    with col_v2:
+        st.session_state.upper_v = st.slider("Max Value", 0, 255, st.session_state.upper_v)
+    
+    # Morphological Operations
+    st.sidebar.subheader("Morphological Operations")
+    st.session_state.use_morphology = st.sidebar.checkbox("Apply Morphological Operations", st.session_state.use_morphology)
+    
+    if st.session_state.use_morphology:
+        st.session_state.kernel_closing = st.sidebar.slider("Closing Kernel Size", 1, 30, st.session_state.kernel_closing)
+        st.session_state.kernel_opening = st.sidebar.slider("Opening Kernel Size", 1, 30, st.session_state.kernel_opening)
+    
+    # Process images if both are uploaded
+    if input_image is not None and background_image is not None:
+        try:
+            # Save uploaded files to temporary location first
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp_input:
+                tmp_input.write(input_image.getvalue())
+                input_path = tmp_input.name
+            
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp_bg:
+                tmp_bg.write(background_image.getvalue())
+                bg_path = tmp_bg.name
+            
+            # Read images with OpenCV directly
+            input_img = cv2.imread(input_path)
+            background_img = cv2.imread(bg_path)
+            
+            # Delete temporary files
+            os.unlink(input_path)
+            os.unlink(bg_path)
+            
+            if input_img is None or background_img is None:
+                st.error("Failed to process one or both images. Please try different image files.")
+                return
+            
+            # Set HSV parameters from sliders
+            lower_hsv = np.array([st.session_state.lower_h, st.session_state.lower_s, st.session_state.lower_v])
+            upper_hsv = np.array([st.session_state.upper_h, st.session_state.upper_s, st.session_state.upper_v])
+            
+            # Process image with current parameters
+            results = process_image(
+                input_img, 
+                background_img, 
+                lower_hsv, 
+                upper_hsv, 
+                st.session_state.kernel_closing, 
+                st.session_state.kernel_opening
+            )
+            
+            # Display results in a grid
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.subheader("Original Image")
+                st.image(cv2.cvtColor(results['original'], cv2.COLOR_BGR2RGB))
+                
+                st.subheader("Background Mask")
+                st.image(results['background_mask'], use_column_width=True)
+                
+                st.subheader("Foreground Mask (Inverted)")
+                st.image(results['foreground_mask'], use_column_width=True)
+            
+            with col2:
+                st.subheader("Background Image")
+                st.image(cv2.cvtColor(background_img, cv2.COLOR_BGR2RGB))
+                
+                st.subheader("Extracted Foreground")
+                st.image(cv2.cvtColor(results['foreground'], cv2.COLOR_BGR2RGB))
+                
+                st.subheader("Final Result")
+                final_result_rgb = cv2.cvtColor(results['final_result'], cv2.COLOR_BGR2RGB)
+                st.image(final_result_rgb, use_column_width=True)
+                
+                # Add download button for the final result
+                result_pil = Image.fromarray(final_result_rgb)
+                buf = io.BytesIO()
+                result_pil.save(buf, format="PNG")
+                byte_im = buf.getvalue()
+                
+                st.download_button(
+                    label="Download Result",
+                    data=byte_im,
+                    file_name="background_replacement_result.png",
+                    mime="image/png"
+                )
+                
+        except Exception as e:
+            st.error(f"An error occurred while processing the images: {str(e)}")
+            st.error("Please try different image files or check if the images are valid.")
+    else:
+        st.info("Please upload both a foreground image and a background image to see results.")
+        
+        # Display demonstration images
+        st.subheader("Example of what this app can do:")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.image("lion.jpg", caption="Original Image Example")
+        with col2:
+            st.image("sky.jpeg", caption="Background Image Example")
+        with col3:
+            st.image("result.png", caption="Result Example")
 
-# 8. Combine Foreground and New Background
-final_result = cv2.add(foreground, new_background_part)
-
-# 9. Display Results using Matplotlib
-plt.figure(figsize=(15, 10))
-
-plt.subplot(2, 3, 1)
-plt.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-plt.title('Original Image')
-plt.axis('off')
-
-plt.subplot(2, 3, 2)
-plt.imshow(mask_background, cmap='gray') # Show initial background mask
-plt.title('Initial Background Mask')
-plt.axis('off')
-
-plt.subplot(2, 3, 3)
-plt.imshow(refined_background_mask, cmap='gray') # Show refined background mask
-plt.title('Refined Background Mask')
-plt.axis('off')
-
-plt.subplot(2, 3, 4)
-plt.imshow(final_mask, cmap='gray') # Show the INVERTED mask (Foreground)
-plt.title('Final Foreground Mask (Inverted)')
-plt.axis('off')
-
-plt.subplot(2, 3, 5)
-plt.imshow(cv2.cvtColor(foreground, cv2.COLOR_BGR2RGB))
-plt.title('Extracted Foreground')
-plt.axis('off')
-
-plt.subplot(2, 3, 6)
-plt.imshow(cv2.cvtColor(final_result, cv2.COLOR_BGR2RGB))
-plt.title('Final Result (New Background)')
-plt.axis('off')
-
-plt.tight_layout()
-plt.show()
-
-# Optionally save the result
-# cv2.imwrite('foreground_extraction_result_v2.jpg', final_result)
-# cv2.imwrite('foreground_mask_v2.jpg', final_mask)
+if __name__ == "__main__":
+    main()
